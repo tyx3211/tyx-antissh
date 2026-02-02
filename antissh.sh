@@ -29,6 +29,9 @@ BACKUP_BIN=""  # 备份路径 = ${TARGET_BIN}.bak
 GRAFTCP_LOCAL_PORT=""  # graftcp-local 监听端口（默认 2233）
 GRAFTCP_PIPE_PATH=""   # graftcp-local FIFO 路径（多实例支持）
 FORCE_SYSTEM_DNS="1"   # 默认强制使用系统 DNS（可选开关）
+# 记录“硬编码 CDP 端口兜底”结果（用于最终输出）
+HARDCODED_CDP_PATCH_PORT=""
+HARDCODED_CDP_PATCH_RESULT="未启用"
 
 ################################ 安全设置 ################################
 
@@ -1245,6 +1248,33 @@ done
 
 log "开始编译 graftcp（日志写入：${INSTALL_LOG}）..."
 
+# 在部分 Conda/交叉编译环境中，cgo 可能会被注入复杂编译参数，导致 runtime/cgo 报引号解析错误。
+# 这里提供一个兜底：仅对 graftcp-local 使用 CGO_ENABLED=0 编译（不依赖 cgo）。
+build_graftcp_local_no_cgo_fallback() {
+  log "检测到 cgo 相关编译错误，尝试使用无 cgo 模式编译 graftcp-local（CGO_ENABLED=0）..."
+
+  # 先确保 graftcp 主程序存在（C 代码编译，通常不受 cgo 影响）
+  if [ ! -x "${GRAFTCP_DIR}/graftcp" ]; then
+    log "先编译 graftcp 主程序..."
+    if [ -n "${GOPROXY_ENV}" ]; then
+      env ${GOPROXY_ENV} make graftcp >> "${INSTALL_LOG}" 2>&1 || return 1
+    else
+      make graftcp >> "${INSTALL_LOG}" 2>&1 || return 1
+    fi
+  fi
+
+  # 只编译 graftcp-local；清掉常见的编译变量，避免引号/转义冲突；禁用 cgo。
+  if [ -n "${GOPROXY_ENV}" ]; then
+    env -u CFLAGS -u CPPFLAGS -u CXXFLAGS -u LDFLAGS CC=gcc CXX=g++ CGO_ENABLED=0 ${GOPROXY_ENV} \
+      make -C local graftcp-local >> "${INSTALL_LOG}" 2>&1 || return 1
+  else
+    env -u CFLAGS -u CPPFLAGS -u CXXFLAGS -u LDFLAGS CC=gcc CXX=g++ CGO_ENABLED=0 \
+      make -C local graftcp-local >> "${INSTALL_LOG}" 2>&1 || return 1
+  fi
+
+  [ -x "${GRAFTCP_DIR}/graftcp" ] && [ -x "${GRAFTCP_DIR}/local/graftcp-local" ]
+}
+
 # 编译重试逻辑
 local make_retries=2
 local make_count=0
@@ -1265,6 +1295,18 @@ make_success="true"
 break
 else
 warn "编译失败，正在分析原因..."
+
+# 兜底：识别 cgo 引号解析错误（常见于 Conda 环境变量注入）
+if tail -120 "${INSTALL_LOG}" 2>/dev/null | grep -q "# runtime/cgo" && \
+   tail -120 "${INSTALL_LOG}" 2>/dev/null | grep -q "missing terminating"; then
+  if build_graftcp_local_no_cgo_fallback; then
+    log "无 cgo 模式编译 graftcp-local 成功。"
+    make_success="true"
+    break
+  else
+    warn "无 cgo 兜底编译失败，继续按常规方式排查..."
+  fi
+fi
 
 # 检查常见错误
 if tail -20 "${INSTALL_LOG}" | grep -q "go: module download"; then
@@ -1385,16 +1427,19 @@ declare -A seen_paths
 for base in "${search_paths[@]}"; do
 if [ -d "${base}" ]; then
 log "搜索目录：${base}"
-while IFS= read -r path; do
-# 跳过 .bak 备份文件（之前脚本运行时创建的备份）
-if [[ "${path}" == *.bak ]]; then
-continue
-fi
-# 去重：检查是否已经添加过
-if [ -z "${seen_paths[${path}]:-}" ]; then
-seen_paths["${path}"]=1
-candidates+=("${path}")
-log "  找到：${path}"
+	while IFS= read -r path; do
+	# 跳过各类备份/衍生文件，避免把 *.bak.patched 之类误识别为 “TARGET_BIN”
+	base_name="$(basename "${path}")"
+	case "${base_name}" in
+	  *.bak|*.bak.*|*.orig|*.patched|*.unpatched|*.tmp|*.swap)
+	    continue
+	    ;;
+	esac
+	# 去重：检查是否已经添加过
+	if [ -z "${seen_paths[${path}]:-}" ]; then
+	seen_paths["${path}"]=1
+	candidates+=("${path}")
+	log "  找到：${path}"
 fi
 done < <(find "${base}" -maxdepth 10 -type f -path "*extensions/antigravity/bin/${pattern}*" 2>/dev/null)
 fi
@@ -1414,11 +1459,17 @@ if [ -z "${base}" ] || [ ! -d "${base}" ]; then
 error "未找到 Agent 文件，请确认 antigravity 安装路径后重试。"
 fi
 
-log "搜索用户指定目录：${base}"
-while IFS= read -r path; do
-candidates+=("${path}")
-done < <(find "${base}" -maxdepth 10 -type f -path "*extensions/antigravity/bin/${pattern}*" 2>/dev/null)
-fi
+	log "搜索用户指定目录：${base}"
+	while IFS= read -r path; do
+	base_name="$(basename "${path}")"
+	case "${base_name}" in
+	  *.bak|*.bak.*|*.orig|*.patched|*.unpatched|*.tmp|*.swap)
+	    continue
+	    ;;
+	esac
+	candidates+=("${path}")
+	done < <(find "${base}" -maxdepth 10 -type f -path "*extensions/antigravity/bin/${pattern}*" 2>/dev/null)
+	fi
 
 if [ "${#candidates[@]}" -eq 0 ]; then
 error "仍然没有找到 language_server_* 可执行文件，请检查 antigravity 安装。"
@@ -1498,6 +1549,181 @@ fi
 
 ################################ 写入 wrapper ################################
 
+# 在多人共享服务器上，经常遇到 9222（Chrome DevTools Protocol 默认端口）被其他进程占用，
+# 且该服务不是 Antigravity 期望的 HTTP/DevTools 服务，导致 language_server 启动阶段卡住直至超时。
+# 这里提供一个“等长二进制字符串替换”的兜底：把原始二进制中硬编码的 localhost:9222 替换为一个空闲的 4 位端口。
+# 说明：
+# - 必须是 4 位端口（因为要保持二进制内字符串长度不变）。
+# - 默认会自动选择一个“相对不常见且稳定”的 4 位端口（范围 6000-9999，并避开 9222）。
+# - 这是兜底手段；若上游修复为正确读取 -cdp_port 参数，可关闭该补丁（ANTISSH_PATCH_HARDCODED_CDP=0）。
+pick_free_4digit_port() {
+  local start="${1:-2468}"
+  local min="${2:-6000}"
+  local max="${3:-9999}"
+  local p
+
+  # 从 start 向上找
+  for p in $(seq "${start}" "${max}" 2>/dev/null); do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | awk -v port=":${p}" '$4 ~ port"$" {found=1} END{exit found}' && continue
+    fi
+    echo "${p}"
+    return 0
+  done
+
+  # 再从 min 回绕到 start-1
+  for p in $(seq "${min}" "$((start-1))" 2>/dev/null); do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | awk -v port=":${p}" '$4 ~ port"$" {found=1} END{exit found}' && continue
+    fi
+    echo "${p}"
+    return 0
+  done
+
+  return 1
+}
+
+patch_hardcoded_cdp_port() {
+  local bin="$1"
+  # 模式：
+  #   - auto（默认）：仅当本机 9222 已被占用（LISTEN）时，才启用等长替换兜底
+  #   - 1：强制启用兜底（无论 9222 是否占用）
+  #   - 0：禁用兜底
+  local mode="${ANTISSH_PATCH_HARDCODED_CDP:-auto}"
+  local desired="${ANTISSH_HARDCODED_CDP_PORT:-}"
+  local port=""
+  local should_patch="false"
+  local port_file="${INSTALL_ROOT}/hardcoded-cdp-port.txt"
+
+  case "${mode}" in
+    0|false|FALSE|no|NO|off|OFF)
+      HARDCODED_CDP_PATCH_RESULT="未启用（已禁用：ANTISSH_PATCH_HARDCODED_CDP=0）"
+      return 0
+      ;;
+    1|true|TRUE|yes|YES|on|ON)
+      should_patch="true"
+      ;;
+    *)
+      # auto：仅当 9222 已被占用时启用兜底
+      if command -v ss >/dev/null 2>&1; then
+        if ss -ltn 2>/dev/null | awk '$4 ~ /:9222$/ {exit 0} END{exit 1}'; then
+          should_patch="true"
+        fi
+      fi
+      ;;
+  esac
+
+  if [ ! -f "${bin}" ]; then
+    return 0
+  fi
+
+  if [ "${should_patch}" != "true" ]; then
+    HARDCODED_CDP_PATCH_RESULT="未启用（auto 模式：检测到 9222 未被占用）"
+    return 0
+  fi
+
+  # 必须是 4 位端口（等长替换）。优先级：
+  # 1) 复用上次成功的端口（若存在且仍空闲）：~/.graftcp-antigravity/hardcoded-cdp-port.txt
+  # 2) 用户指定：ANTISSH_HARDCODED_CDP_PORT（4 位数字）
+  # 3) 自动选择：基于 USER@HOSTNAME 派生一个相对不常见且稳定的 4 位端口（范围 6000-9999，避开 9222）
+  # 4) 兜底：2468
+  if [ -z "${desired}" ] && [ -f "${port_file}" ]; then
+    local prev
+    prev="$(cat "${port_file}" 2>/dev/null || true)"
+    if echo "${prev}" | grep -Eq '^[0-9]{4}$'; then
+      port="${prev}"
+    fi
+  fi
+
+  if [ -n "${desired}" ] && echo "${desired}" | grep -Eq '^[0-9]{4}$'; then
+    port="${desired}"
+  fi
+
+  if ! echo "${port:-}" | grep -Eq '^[0-9]{4}$'; then
+    if command -v python3 >/dev/null 2>&1; then
+      port="$(
+        USER="${USER:-unknown}" HOSTNAME="${HOSTNAME:-unknown}" python3 - <<'PY' 2>/dev/null || true
+import os
+import zlib
+
+key = f"{os.environ.get('USER','unknown')}@{os.environ.get('HOSTNAME','unknown')}".encode("utf-8")
+v = zlib.crc32(key) % 4000 + 6000  # 6000-9999
+if v == 9222:
+    v = 9223
+print(f"{v:04d}")
+PY
+      )"
+    fi
+  fi
+
+  if ! echo "${port:-}" | grep -Eq '^[0-9]{4}$'; then
+    port="2468"
+  fi
+
+  # 如果候选端口恰好等于 9222，强行避开（避免“补丁没补到位”的误会）
+  if [ "${port}" = "9222" ]; then
+    port="9223"
+  fi
+
+  # 如果端口被占用，换一个空闲 4 位端口
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | awk -v port=":${port}" '$4 ~ port"$" {exit 0} END{exit 1}'; then
+      port="$(pick_free_4digit_port "${port}" 6000 9999 2>/dev/null || true)"
+      if [ -z "${port:-}" ]; then
+        warn "无法选择空闲 4 位端口，跳过 hardcoded CDP 端口补丁"
+        return 0
+      fi
+    fi
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "未找到 python3，跳过 hardcoded CDP 端口补丁"
+    return 0
+  fi
+
+  # 二进制等长替换：localhost:9222 -> localhost:${port}
+  # 为了可逆，先保留原始副本（仅首次）
+  if [ ! -f "${bin}.orig" ]; then
+    cp -a "${bin}" "${bin}.orig" 2>/dev/null || true
+  fi
+
+  python3 - "${bin}" "${port}" <<'PY' >/dev/null 2>&1 || true
+import os
+import stat
+import sys
+from pathlib import Path
+
+bin_path = Path(sys.argv[1])
+port = sys.argv[2]
+old = b"localhost:9222"
+new = f"localhost:{port}".encode("ascii")
+
+if len(old) != len(new):
+    raise SystemExit("len mismatch")
+
+data = bin_path.read_bytes()
+cnt = data.count(old)
+if cnt == 0:
+    # 上游若已修复/移除硬编码，这里直接跳过
+    raise SystemExit(0)
+
+st = bin_path.stat()
+tmp = bin_path.with_suffix(bin_path.suffix + ".tmp")
+tmp.write_bytes(data.replace(old, new))
+os.chmod(tmp, stat.S_IMODE(st.st_mode))
+os.replace(tmp, bin_path)
+PY
+
+  # 记录结果，供最终输出与 wrapper 日志提示
+  mkdir -p "${INSTALL_ROOT}" 2>/dev/null || true
+  echo "${port}" > "${port_file}" 2>/dev/null || true
+  chmod 600 "${port_file}" 2>/dev/null || true
+
+  HARDCODED_CDP_PATCH_PORT="${port}"
+  HARDCODED_CDP_PATCH_RESULT="已启用（localhost:9222 -> localhost:${port}，4 位端口兜底）"
+  return 0
+}
+
 # 函数名：setup_wrapper
 # 功能：备份原始 Agent 并生成代理 wrapper 脚本
 # 设置变量：BACKUP_BIN
@@ -1560,14 +1786,19 @@ if is_wrapper_script "${TARGET_BIN}"; then
 error "异常：${TARGET_BIN} 是 wrapper 脚本，但备份文件 ${BACKUP_BIN} 不存在！请手动检查。"
 fi
 
-# 正常情况：首次运行，备份原始文件
-log "备份原始 Agent 服务到：${BACKUP_BIN}"
-mv "${TARGET_BIN}" "${BACKUP_BIN}" || error "备份失败：无法移动 ${TARGET_BIN} -> ${BACKUP_BIN}"
-fi
+	# 正常情况：首次运行，备份原始文件
+	log "备份原始 Agent 服务到：${BACKUP_BIN}"
+	mv "${TARGET_BIN}" "${BACKUP_BIN}" || error "备份失败：无法移动 ${TARGET_BIN} -> ${BACKUP_BIN}"
+	fi
 
-# 生成 wrapper 脚本（先写临时文件，再 mv 覆盖，尽量保证写入原子性）
-local wrapper_tmp
-wrapper_tmp=$(safe_mktemp "${TARGET_BIN}.tmp") || error "无法创建临时文件"
+	# 兜底：修复原始二进制中硬编码的 localhost:9222（若启用/需要），避免多人服务器上 9222 被占用导致启动卡死
+	# 返回值：若补丁生效，输出 4 位端口（例如 2468/4681）；否则输出空
+	# 注意：不要用 $(...) 包裹函数调用，否则会在子 shell 中执行，导致 HARDCODED_CDP_PATCH_RESULT 等变量无法回写。
+	patch_hardcoded_cdp_port "${BACKUP_BIN}" || true
+
+	# 生成 wrapper 脚本（先写临时文件，再 mv 覆盖，尽量保证写入原子性）
+	local wrapper_tmp
+	wrapper_tmp=$(safe_mktemp "${TARGET_BIN}.tmp") || error "无法创建临时文件"
 # 注册临时文件到清理列表，确保脚本异常退出时也能清理
 TEMP_FILES_TO_CLEANUP+=("${wrapper_tmp}")
 
@@ -1584,10 +1815,64 @@ PROXY_TYPE="${PROXY_TYPE}"
 GRAFTCP_LOCAL_PORT="${GRAFTCP_LOCAL_PORT}"
 GRAFTCP_PIPE_PATH="${GRAFTCP_PIPE_PATH}"
 ANTISSH_FORCE_SYSTEM_DNS="\${ANTISSH_FORCE_SYSTEM_DNS:-${FORCE_SYSTEM_DNS}}"
-LOG_FILE="\$HOME/.graftcp-antigravity/wrapper.log"
+# 默认不禁用 HTTP/2 / TLS1.3；如遇到特定网络/握手问题，可在启动 Antigravity 前设置为 1 再重试。
+ANTISSH_DISABLE_HTTP2="\${ANTISSH_DISABLE_HTTP2:-0}"
+ANTISSH_DISABLE_TLS13="\${ANTISSH_DISABLE_TLS13:-0}"
+# Chrome DevTools Protocol 端口（多用户共享服务器经常发生 9222 冲突）
+# 默认使用 graftcp-local 端口 + 1（例如 24680 -> 24681），也可通过环境变量固定。
+ANTISSH_CDP_PORT="\${ANTISSH_CDP_PORT:-}"
+# 某些版本的 language_server 会尝试连接本机 9222（CDP）。在多人服务器上 9222 常被其他进程占用，
+# 且该服务可能不是 Antigravity 期望的 CDP 服务，容易导致 language_server 启动阶段卡住并最终超时。
+# 默认关闭“页面动作/覆盖层”功能以避免依赖 CDP（如你确实需要再设为 0）。
+ANTISSH_DISABLE_PAGE_ACTIONS="\${ANTISSH_DISABLE_PAGE_ACTIONS:-1}"
+	LOG_FILE="\$HOME/.graftcp-antigravity/wrapper.log"
+	HARDCODED_CDP_PORT_FILE="\$HOME/.graftcp-antigravity/hardcoded-cdp-port.txt"
 
-mkdir -p "\$(dirname "\$LOG_FILE")"
-echo "[\$(date)] Starting wrapper: \$0 \$@" >> "\$LOG_FILE"
+	mkdir -p "\$(dirname "\$LOG_FILE")"
+	echo "[\$(date)] Starting wrapper: \$0 \$@" >> "\$LOG_FILE"
+	if [ -f "\${HARDCODED_CDP_PORT_FILE}" ]; then
+	  hc_port="\$(cat "\${HARDCODED_CDP_PORT_FILE}" 2>/dev/null || true)"
+	  if echo "\${hc_port}" | grep -Eq '^[0-9]{4}$'; then
+	    echo "[\$(date)] Hardcoded CDP endpoint override: localhost:9222 -> localhost:\${hc_port}" >> "\$LOG_FILE"
+	  fi
+	fi
+
+# 选择一个可用的 CDP 端口，避免默认 9222 与其他用户冲突导致 language_server 卡住/超时
+pick_free_port() {
+  local start="\$1"
+  local p
+  for p in "\$(seq "\$start" "\$((start+200))")"; do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | awk -v port=":\$p" '\$4 ~ port"$" {found=1} END{exit found}' && continue
+      echo "\$p"
+      return 0
+    fi
+    # 无 ss 时不做强校验，直接返回候选端口
+    echo "\$p"
+    return 0
+  done
+  return 1
+}
+
+CDP_PORT=""
+if [ -n "\${ANTISSH_CDP_PORT}" ] && echo "\${ANTISSH_CDP_PORT}" | grep -Eq '^[0-9]+$'; then
+  CDP_PORT="\${ANTISSH_CDP_PORT}"
+else
+  CDP_PORT="\$((GRAFTCP_LOCAL_PORT+1))"
+fi
+
+# 如果端口被占用（尤其是默认 9222），则从候选范围中挑一个空闲端口
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn 2>/dev/null | awk -v port=":\${CDP_PORT}" '\$4 ~ port"$" {exit 0} END{exit 1}'; then
+    new_port="\$(pick_free_port "\$((GRAFTCP_LOCAL_PORT+1))" 2>/dev/null || true)"
+    if [ -n "\${new_port:-}" ]; then
+      CDP_PORT="\${new_port}"
+    fi
+  fi
+fi
+
+echo "[\$(date)] Using CDP_PORT=\${CDP_PORT}" >> "\$LOG_FILE"
+echo "[\$(date)] ANTISSH_DISABLE_PAGE_ACTIONS=\${ANTISSH_DISABLE_PAGE_ACTIONS}" >> "\$LOG_FILE"
 
 # 检查指定 FIFO 路径的 graftcp-local 是否已在运行
 graftcp_running="false"
@@ -1611,10 +1896,10 @@ if [ "\$graftcp_running" = "false" ]; then
  sleep 0.5 2>/dev/null || sleep 1
 fi
 
-# 设置 GODEBUG，保留用户原有值并追加所需配置
+# 设置 GODEBUG：保留用户原有值并追加所需配置
 # 1. 可选：强制使用系统 DNS（默认开启，可用 ANTISSH_FORCE_SYSTEM_DNS=0 关闭）
-# 2. 关闭 HTTP/2 客户端 (解决 EOF 等问题)
-# 3. 关闭 TLS 1.3 (避免部分环境握手问题)
+# 2. 可选：禁用 HTTP/2 客户端（ANTISSH_DISABLE_HTTP2=1）
+# 3. 可选：禁用 TLS 1.3（ANTISSH_DISABLE_TLS13=1）
 DNS_FORCE="\${ANTISSH_FORCE_SYSTEM_DNS:-1}"
 DNS_GODEBUG=""
 case "\${DNS_FORCE}" in
@@ -1626,19 +1911,44 @@ case "\${DNS_FORCE}" in
     ;;
 esac
 
-EXTRA_GODEBUG="http2client=0,tls13=0"
+# 按需拼接额外的 GODEBUG 配置，避免产生多余逗号
+EXTRA_GODEBUG=""
+case "\${ANTISSH_DISABLE_HTTP2:-0}" in
+  1|true|TRUE|yes|YES|on|ON) EXTRA_GODEBUG="http2client=0" ;;
+esac
+case "\${ANTISSH_DISABLE_TLS13:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    if [ -n "\${EXTRA_GODEBUG}" ]; then
+      EXTRA_GODEBUG="\${EXTRA_GODEBUG},tls13=0"
+    else
+      EXTRA_GODEBUG="tls13=0"
+    fi
+    ;;
+esac
 if [ -n "\${DNS_GODEBUG}" ]; then
-  EXTRA_GODEBUG="\${DNS_GODEBUG},\${EXTRA_GODEBUG}"
+  if [ -n "\${EXTRA_GODEBUG}" ]; then
+    EXTRA_GODEBUG="\${DNS_GODEBUG},\${EXTRA_GODEBUG}"
+  else
+    EXTRA_GODEBUG="\${DNS_GODEBUG}"
+  fi
 fi
-
-if [ -n "\${GODEBUG:-}" ]; then
-  export GODEBUG="\${GODEBUG},\${EXTRA_GODEBUG}"
-else
-  export GODEBUG="\${EXTRA_GODEBUG}"
+if [ -n "\${EXTRA_GODEBUG}" ]; then
+  if [ -n "\${GODEBUG:-}" ]; then
+    export GODEBUG="\${GODEBUG},\${EXTRA_GODEBUG}"
+  else
+    export GODEBUG="\${EXTRA_GODEBUG}"
+  fi
 fi
 
 # 通过 graftcp 启动原始二进制（指定端口与 FIFO），并清除代理相关环境变量，避免递归代理/死循环
-exec "\$GRAFTCP_DIR/graftcp" -p "\$GRAFTCP_LOCAL_PORT" -f "\$GRAFTCP_PIPE_PATH" env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+EXTRA_ARGS=()
+EXTRA_ARGS+=("--cdp_port=\${CDP_PORT}")
+case "\${ANTISSH_DISABLE_PAGE_ACTIONS:-1}" in
+  0|false|FALSE|no|NO|off|OFF) ;;
+  *) EXTRA_ARGS+=("--use_custom_page_actions=false") ;;
+esac
+
+exec "\$GRAFTCP_DIR/graftcp" -p "\$GRAFTCP_LOCAL_PORT" -f "\$GRAFTCP_PIPE_PATH" env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@" "\${EXTRA_ARGS[@]}"
 EOF
 
 # 设置执行权限
@@ -1924,12 +2234,13 @@ main() {
   test_proxy
 
   echo
-  echo "=================== 配置完成 🎉 ==================="
-  echo "graftcp 安装目录： ${GRAFTCP_DIR}"
-  echo "Agent 备份文件：   ${BACKUP_BIN}"
-  echo "当前代理：         ${PROXY_TYPE}://${PROXY_URL}"
-  echo "graftcp-local 端口: ${GRAFTCP_LOCAL_PORT}"
-  echo
+	  echo "=================== 配置完成 🎉 ==================="
+	  echo "graftcp 安装目录： ${GRAFTCP_DIR}"
+	  echo "Agent 备份文件：   ${BACKUP_BIN}"
+	  echo "当前代理：         ${PROXY_TYPE}://${PROXY_URL}"
+	  echo "graftcp-local 端口: ${GRAFTCP_LOCAL_PORT}"
+	  echo "硬编码兜底（9222）: ${HARDCODED_CDP_PATCH_RESULT}"
+	  echo
   echo "如需修改代理："
   echo "  1. 直接重新运行本脚本，按提示输入新的代理地址即可。"
   echo "  2. 或手动编辑 wrapper 文件："
@@ -1942,13 +2253,19 @@ main() {
   echo "       ${TARGET_BIN}"
   echo "     将 ANTISSH_FORCE_SYSTEM_DNS 设置为 1（强制）或 0（不强制）。"
   echo
-  echo "如需完全恢复原始行为："
-  echo "  mv \"${BACKUP_BIN}\" \"${TARGET_BIN}\""
-  echo
-  echo "安装/编译日志位于：${INSTALL_LOG}"
-  echo
-  echo "⚠️ 如果是远程连接，请断开并重新连接，即可生效，编码愉快！"
-  echo "==================================================="
+	  echo "如需完全恢复原始行为："
+	  echo "  mv \"${BACKUP_BIN}\" \"${TARGET_BIN}\""
+	  echo
+	  echo "如需控制“硬编码兜底（9222）”："
+	  echo "  - 默认：ANTISSH_PATCH_HARDCODED_CDP=auto（仅当 9222 被占用时启用）"
+	  echo "  - 强制开启：ANTISSH_PATCH_HARDCODED_CDP=1"
+	  echo "  - 关闭：ANTISSH_PATCH_HARDCODED_CDP=0"
+	  echo "  - 指定 4 位兜底端口：ANTISSH_HARDCODED_CDP_PORT=2468（必须 4 位）"
+	  echo
+	  echo "安装/编译日志位于：${INSTALL_LOG}"
+	  echo
+	  echo "⚠️ 如果是远程连接，请断开并重新连接，即可生效，编码愉快！"
+	  echo "==================================================="
 }
 
 main
