@@ -1,5 +1,13 @@
 ﻿# 反重力代理配置工具
 
+> tyx 注：
+> 当前反重力远端 server 的实现会在二进制中硬编码 `localhost:9222/json/list` 访问，并且文档中未提及如何避免这个访问。
+> 这会在多人开发共享服务器上，当别的用户先占住 `9222` 端口后，我方远端 server 卡在 waiting for language server start ，使得 agent pane 无法 loading 成功。
+> 该 fork 使用了一种釜底抽薪的等长二进制替换兜底方案，解决了这个问题。
+> antigravity 应该不久后会修复类似问题，或者进一步明确文档。
+
+> 且当前 fork 也更适合用户级别 `no-sudo` 情况下，在 `conda` 下准备 `go` 环境并编译，因为该 fork 改为默认禁用 `cgo` 编译，可以避免编译标志在 `conda` 下可能出现的转义识别问题。
+
 为 反重力 Agent 配置代理，解决网络连接问题。
 
 ## 系统支持
