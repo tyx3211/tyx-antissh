@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
-# Antigravity Agent + graftcp 一键配置脚本
+# Antigravity Agent 代理一键配置脚本（支持 gg / graftcp）
 # 支持：Linux（macOS 需使用 Proxifier 等替代方案）
 # 作用：
 #   1. 询问是否需要代理，以及代理地址（格式：socks5://ip:port 或 http://ip:port）
-#   2. 自动安装 / 编译 graftcp（Go 项目，使用 Go modules，要求 Go >= 1.13）
+#   2. 根据后端安装 / 编译 gg 或 graftcp（Go 项目）
 #   3. 自动查找 antigravity 的 language_server_* 可执行文件
 #   4. 备份原二进制为 .bak，并写入 wrapper
 #
 # 安装位置：
 #   graftcp 安装在：$HOME/.graftcp-antigravity/graftcp
+#   gg 安装在：     $HOME/.graftcp-antigravity/gg
 #   安装日志：      $HOME/.graftcp-antigravity/install.log
+# 可选参数：
+#   --backend gg|graftcp   显式指定后端（默认 gg）
+#   -h, --help             显示帮助
 
 ################################ 基本变量 ################################
 
@@ -23,15 +27,20 @@ PM=""          # 包管理器
 SUDO=""        # sudo 命令
 PROXY_URL=""   # 代理地址（不含协议前缀，如 127.0.0.1:10808）
 PROXY_TYPE=""  # socks5 或 http
+PROXY_BACKEND="${ANTISSH_PROXY_BACKEND:-gg}" # 代理后端：gg 或 graftcp
 GRAFTCP_DIR="${GRAFTCP_DIR:-}" # 保留用户通过环境变量传入的值，空则后续设为 ${REPO_DIR}
+GG_DIR="${INSTALL_ROOT}/gg"
+GG_BIN="${GG_BIN:-}" # 可通过环境变量指定 gg 可执行文件
+GG_NODE_LINK=""      # gg 使用的节点链接（如 socks5://127.0.0.1:25330）
 TARGET_BIN=""  # language_server_* 路径
 BACKUP_BIN=""  # 备份路径 = ${TARGET_BIN}.bak
 GRAFTCP_LOCAL_PORT=""  # graftcp-local 监听端口（默认 2233）
 GRAFTCP_PIPE_PATH=""   # graftcp-local FIFO 路径（多实例支持）
-FORCE_SYSTEM_DNS="1"   # 默认强制使用系统 DNS（可选开关）
+FORCE_SYSTEM_DNS="1"   # 仅 graftcp 路径使用：是否强制 netdns=cgo
 # 记录“硬编码 CDP 端口兜底”结果（用于最终输出）
 HARDCODED_CDP_PATCH_PORT=""
 HARDCODED_CDP_PATCH_RESULT="未启用"
+CLI_BACKEND_SET="0"
 
 ################################ 安全设置 ################################
 
@@ -118,6 +127,84 @@ date -d "@${epoch}" '+%F %T %z' 2>/dev/null && return 0
 # 降级处理：无法格式化时返回 unknown
 echo "unknown"
 return 1
+}
+
+# 从 language_server 路径中提取 antigravity 的版本目录名
+# 例如：
+#   /home/u/.antigravity-server/bin/1.19.6-<commit>/extensions/antigravity/bin/language_server_linux_x64
+# 提取为：
+#   1.19.6-<commit>
+extract_antigravity_version_dir() {
+local path="$1"
+local marker="/.antigravity-server/bin/"
+local tail version_dir
+
+case "${path}" in
+  *"${marker}"*)
+    tail="${path#*"${marker}"}"
+    version_dir="${tail%%/extensions/antigravity/bin/*}"
+    if [ -n "${version_dir}" ] && [ "${version_dir}" != "${tail}" ]; then
+      echo "${version_dir}"
+      return 0
+    fi
+    ;;
+esac
+
+return 1
+}
+
+# 将语义化版本（x.y.z）转为可排序 key（零填充）
+semver_sort_key() {
+local raw="$1"
+local core major minor patch
+core="${raw%%-*}"
+
+if [[ "${core}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+  printf '%09d.%09d.%09d' "${major}" "${minor}" "${patch}"
+  return 0
+fi
+
+return 1
+}
+
+# 从候选 language_server 列表中选择“最新”的一个：
+# 1) 优先按版本号（x.y.z）比较
+# 2) 版本号相同再按 mtime 比较
+# 3) 若都无法解析版本号，则回退到仅按 mtime
+pick_latest_language_server() {
+local -a paths=("$@")
+local -a semver_rows=()
+local -a mtime_rows=()
+local p version_dir semver_key mtime
+
+if [ "${#paths[@]}" -eq 0 ]; then
+  return 1
+fi
+
+for p in "${paths[@]}"; do
+  version_dir="$(extract_antigravity_version_dir "${p}" 2>/dev/null || true)"
+  semver_key=""
+  if [ -n "${version_dir}" ]; then
+    semver_key="$(semver_sort_key "${version_dir}" 2>/dev/null || true)"
+  fi
+  mtime="$(get_file_mtime "${p}" 2>/dev/null || echo 0)"
+
+  mtime_rows+=("${mtime}|${p}")
+  if [ -n "${semver_key}" ]; then
+    semver_rows+=("${semver_key}|${mtime}|${p}")
+  fi
+done
+
+if [ "${#semver_rows[@]}" -gt 0 ]; then
+  printf '%s\n' "${semver_rows[@]}" | sort -t'|' -k1,1r -k2,2nr | head -n 1 | cut -d'|' -f3-
+  return 0
+fi
+
+printf '%s\n' "${mtime_rows[@]}" | sort -t'|' -k1,1nr | head -n 1 | cut -d'|' -f2-
+return 0
 }
 
 # 原地编辑文件（兼容不同 sed 实现）
@@ -444,6 +531,8 @@ local scheme host port host_port
 
 PARSE_ERROR=""
 
+normalize_proxy_backend
+
 # 检查是否包含协议前缀
 if ! echo "${input}" | grep -Eq '^(socks5h?|https?|http)://'; then
 PARSE_ERROR="代理地址必须包含协议前缀（socks5:// 或 http://；兼容 socks5h://、https://）"
@@ -461,7 +550,7 @@ PROXY_TYPE="socks5"
 ;;
 socks5h)
 # socks5h = socks5 with remote DNS resolution
-# graftcp 不支持 socks5h，自动转换为 socks5
+# gg / graftcp 均按 socks5 处理
 echo "⚠️  检测到 socks5h:// 协议，将自动转换为 socks5://"
 PROXY_TYPE="socks5"
 ;;
@@ -469,6 +558,7 @@ http)
 PROXY_TYPE="http"
 ;;
 https)
+if [ "${PROXY_BACKEND}" = "graftcp" ]; then
 # 警告：graftcp-local 仅支持明文 HTTP 代理（CONNECT 方法），不支持 TLS 加密的代理隧道
 echo ""
 echo "⚠️  检测到 https:// 代理协议"
@@ -477,9 +567,12 @@ echo "   不支持以 TLS 加密方式连接代理服务器（https:// 代理）
 echo "   将自动转换为 http:// 处理，如果连接失败，请确认代理服务器支持明文 HTTP 连接"
 echo ""
 PROXY_TYPE="http"
+else
+PROXY_TYPE="https"
+fi
 ;;
 *)
-PARSE_ERROR="仅支持 socks5 或 http 协议，当前输入：${scheme}"
+PARSE_ERROR="仅支持 socks5 / http / https 协议，当前输入：${scheme}"
 return 1
 ;;
 esac
@@ -518,6 +611,108 @@ fi
 PROXY_URL="${host}:${port}"
 
 return 0
+}
+
+normalize_proxy_backend() {
+case "${PROXY_BACKEND}" in
+gg|GG|go-graft|gograft)
+PROXY_BACKEND="gg"
+;;
+graftcp|GRAFTCP)
+PROXY_BACKEND="graftcp"
+;;
+*)
+error "不支持的代理后端：${PROXY_BACKEND}（仅支持 gg 或 graftcp）"
+;;
+esac
+}
+
+build_gg_node_link() {
+case "${PROXY_TYPE}" in
+socks5)
+GG_NODE_LINK="socks5://${PROXY_URL}"
+;;
+http)
+GG_NODE_LINK="http://${PROXY_URL}"
+;;
+https)
+GG_NODE_LINK="https://${PROXY_URL}"
+;;
+*)
+error "无法生成 gg 节点链接：不支持的代理类型 ${PROXY_TYPE}"
+;;
+esac
+}
+
+build_proxy_full_url() {
+case "${PROXY_TYPE}" in
+socks5)
+echo "socks5://${PROXY_URL}"
+;;
+http)
+echo "http://${PROXY_URL}"
+;;
+https)
+echo "https://${PROXY_URL}"
+;;
+*)
+error "无法构造代理 URL：不支持的代理类型 ${PROXY_TYPE}"
+;;
+esac
+}
+
+show_usage() {
+cat <<'EOF'
+用法：
+  bash ./antissh.sh [--backend gg|graftcp]
+
+参数：
+  --backend, -b   显式指定代理后端；默认使用 gg
+  -h, --help      显示帮助
+
+示例：
+  bash ./antissh.sh
+  bash ./antissh.sh --backend gg
+  bash ./antissh.sh --backend graftcp
+  ANTISSH_PROXY_BACKEND=graftcp bash ./antissh.sh
+EOF
+}
+
+parse_args() {
+while [ "$#" -gt 0 ]; do
+case "$1" in
+  --backend|-b)
+    if [ "$#" -lt 2 ]; then
+      error "参数 $1 需要一个值（gg 或 graftcp）"
+    fi
+    PROXY_BACKEND="$2"
+    CLI_BACKEND_SET="1"
+    shift 2
+    ;;
+  -h|--help)
+    show_usage
+    exit 0
+    ;;
+  *)
+    error "未知参数：$1；可使用 --help 查看用法。"
+    ;;
+esac
+done
+}
+
+show_backend_selection_hint() {
+echo "当前代理后端：${PROXY_BACKEND}"
+if [ "${CLI_BACKEND_SET}" = "1" ]; then
+echo "后端来源：命令行参数 --backend"
+elif [ -n "${ANTISSH_PROXY_BACKEND:-}" ]; then
+echo "后端来源：环境变量 ANTISSH_PROXY_BACKEND"
+else
+echo "后端来源：默认值（gg）"
+fi
+echo "如需切换后端："
+echo "  - 本次运行：bash ./antissh.sh --backend graftcp"
+echo "  - 或环境变量：ANTISSH_PROXY_BACKEND=graftcp bash ./antissh.sh"
+echo ""
 }
 
 ################################ 从环境变量中检测代理 ################################
@@ -588,6 +783,14 @@ echo
 echo "请输入代理地址，格式示例："
 echo "  SOCKS5: socks5://127.0.0.1:10808"
 echo "  HTTP:   http://127.0.0.1:10809"
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+echo "  HTTPS:  https://127.0.0.1:10810"
+echo ""
+echo "说明：gg 默认作为主后端，推荐优先使用 socks5。"
+else
+echo ""
+echo "说明：当前使用 graftcp 后端；如输入 https://，会自动按 http:// 处理。"
+fi
 echo ""
 echo "直接回车 = 不设置代理，退出脚本"
 
@@ -687,7 +890,7 @@ local choice=""
 
 echo ""
 echo "============================================="
-echo " DNS 解析策略"
+echo " graftcp DNS 解析策略"
 echo "============================================="
 echo "默认：强制使用系统 DNS（GODEBUG=netdns=cgo）"
 echo "说明："
@@ -716,6 +919,21 @@ esac
 log "DNS 策略：强制系统 DNS=${FORCE_SYSTEM_DNS}"
 }
 
+show_gg_dns_note() {
+echo ""
+echo "============================================="
+echo " gg DNS / UDP 说明"
+echo "============================================="
+if [ "${PROXY_TYPE}" = "socks5" ]; then
+echo "当前代理类型：socks5"
+echo "gg 将保留 UDP/DNS 接管能力，运行时会拦截 DNS 请求并维护域名映射。"
+else
+echo "当前代理类型：${PROXY_TYPE}"
+echo "HTTP/HTTPS 节点不支持 UDP 转发，wrapper 会自动为 gg 附加 --noudp。"
+echo "这种情况下 gg 不再接管 UDP/DNS，域名解析将回退到本机 resolver。"
+fi
+}
+
 ################################ 轻量级代理可用性探测 ################################
 
 # 快速探测代理是否可用
@@ -725,18 +943,13 @@ PROXY_ENV_EXPORTED="false"
 
 probe_and_export_proxy() {
 local proxy_full_url=""
+proxy_full_url="$(build_proxy_full_url)"
 
-# 构造完整代理 URL
-if [ "${PROXY_TYPE}" = "socks5" ]; then
-proxy_full_url="socks5://${PROXY_URL}"
-else
-proxy_full_url="http://${PROXY_URL}"
-fi
-
-log "正在快速探测代理可用性...（连接超时 3 秒，总超时 5 秒）"
+log "正在快速探测代理可用性...（仅用于 git/curl 下载阶段，连接超时 3 秒，总超时 5 秒）"
 
 # 使用 curl 进行轻量级探测
 # 尝试访问一个快速响应的地址（目标可能被网络策略阻断；失败不影响后续流程）
+# 注意：这里只决定后续 git/curl 是否临时导出代理环境变量，不代表最终 language_server 行为。
 local probe_result=1
 
 if [ "${PROXY_TYPE}" = "socks5" ]; then
@@ -745,8 +958,8 @@ if curl -s --socks5 "${PROXY_URL}" --connect-timeout 3 --max-time 5 -o /dev/null
 probe_result=0
 fi
 else
-# 对于 http 代理，使用 -x 选项
-if curl -s -x "${proxy_full_url}" --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null | grep -qE '^(200|301|302)$'; then
+# 对于 http/https 代理，统一使用 --proxy
+if curl -s --proxy "${proxy_full_url}" --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null | grep -qE '^(200|301|302)$'; then
 probe_result=0
 fi
 fi
@@ -794,8 +1007,10 @@ fi
 NEED_GO_COMPAT="false"
 
 # 函数名：check_go_version
-# 功能：检查 Go 版本是否满足要求（>= 1.13），并处理 toolchain 兼容性
-# 设置变量：NEED_GO_COMPAT (“true” 如果需要兼容模式)
+# 功能：按后端检查 Go 版本要求
+# - gg:      要求 Go >= 1.18，默认按纯 Go 路径构建
+# - graftcp: 要求 Go >= 1.13；当 < 1.21 时可进入兼容模式
+# 设置变量：NEED_GO_COMPAT (“true” 如果 graftcp 需要兼容模式)
 check_go_version() {
 if ! command -v go >/dev/null 2>&1; then
 # 缺 go 的情况交给依赖安装逻辑
@@ -809,12 +1024,22 @@ major="${gv%%.*}"
 rest="${gv#*.}"
 minor="${rest%%.*}"
 
-# graftcp 使用 Go Modules，要求 Go >= 1.13
-if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 13 ]; }; then
-error "检测到 Go 版本 ${gv_raw}，过低（要求 >= 1.13），请先升级 Go 后重试。"
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 18 ]; }; then
+error "检测到 Go 版本 ${gv_raw}，过低（gg 要求 >= 1.18），请先升级 Go 后重试。"
 fi
 
-log "Go 版本检查通过：${gv_raw}"
+NEED_GO_COMPAT="false"
+log "Go 版本检查通过：${gv_raw}（gg / 纯 Go 构建）"
+return
+fi
+
+# graftcp 使用 Go Modules，要求 Go >= 1.13
+if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 13 ]; }; then
+error "检测到 Go 版本 ${gv_raw}，过低（graftcp 要求 >= 1.13），请先升级 Go 后重试。"
+fi
+
+log "Go 版本检查通过：${gv_raw}（graftcp）"
 
 # 检查是否需要升级 Go（< 1.21 时 go.mod 的 toolchain 指令不被支持）
 if [ "${major}" -eq 1 ] && [ "${minor}" -lt 21 ]; then
@@ -980,26 +1205,31 @@ NEED_GO_COMPAT="false"
 }
 
 # 函数名：ensure_dependencies
-# 功能：检查并安装编译 graftcp 所需的依赖（git, make, gcc, go, curl）
+# 功能：按后端检查并安装依赖
 # 错误处理：依赖安装失败时调用 error() 退出
 ensure_dependencies() {
 detect_pkg_manager
 
 missing=()
-# 核心编译依赖
-for cmd in git make gcc go; do
+local -a required_cmds
+local required_label=""
+
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+required_cmds=(git go curl)
+required_label="git / go / curl"
+else
+required_cmds=(git make gcc go curl)
+required_label="git / make / gcc / go / curl"
+fi
+
+for cmd in "${required_cmds[@]}"; do
 if ! command -v "${cmd}" >/dev/null 2>&1; then
 missing+=("${cmd}")
 fi
 done
 
-# 网络工具依赖
-if ! command -v curl >/dev/null 2>&1; then
-missing+=("curl")
-fi
-
 if [ "${#missing[@]}" -eq 0 ]; then
-log "依赖已满足：git / make / gcc / go / curl"
+log "依赖已满足：${required_label}"
 check_go_version
 return
 fi
@@ -1027,18 +1257,27 @@ local pipestatus_arr
 case "${PM}" in
 apt)
 ${SUDO} apt-get update | tee -a "${INSTALL_LOG}"
-# 安装核心编译依赖 + curl + procps（pgrep/pkill）+ 可选的 net-tools（netstat）
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+${SUDO} apt-get install -y git golang-go curl 2>&1 | tee -a "${INSTALL_LOG}"
+pipestatus_arr=("${PIPESTATUS[@]}")
+install_result="${pipestatus_arr[0]}"
+else
 ${SUDO} apt-get install -y git make gcc golang-go curl procps net-tools 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
 if [ "${install_result}" -ne 0 ]; then
-# 回退到不包含 net-tools 的版本
 ${SUDO} apt-get install -y git make gcc golang-go curl procps 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
 fi
+fi
 ;;
 dnf)
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+${SUDO} dnf install -y git golang curl 2>&1 | tee -a "${INSTALL_LOG}"
+pipestatus_arr=("${PIPESTATUS[@]}")
+install_result="${pipestatus_arr[0]}"
+else
 ${SUDO} dnf install -y git make gcc golang curl procps-ng net-tools 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
@@ -1047,8 +1286,14 @@ ${SUDO} dnf install -y git make gcc golang curl procps-ng 2>&1 | tee -a "${INSTA
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
 fi
+fi
 ;;
 yum)
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+${SUDO} yum install -y git golang curl 2>&1 | tee -a "${INSTALL_LOG}"
+pipestatus_arr=("${PIPESTATUS[@]}")
+install_result="${pipestatus_arr[0]}"
+else
 ${SUDO} yum install -y git make gcc golang curl procps-ng net-tools 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
@@ -1057,8 +1302,14 @@ ${SUDO} yum install -y git make gcc golang curl procps-ng 2>&1 | tee -a "${INSTA
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
 fi
+fi
 ;;
 pacman)
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+${SUDO} pacman -Sy --noconfirm git go curl 2>&1 | tee -a "${INSTALL_LOG}"
+pipestatus_arr=("${PIPESTATUS[@]}")
+install_result="${pipestatus_arr[0]}"
+else
 ${SUDO} pacman -Sy --noconfirm git base-devel go curl procps-ng net-tools 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
@@ -1067,9 +1318,15 @@ ${SUDO} pacman -Sy --noconfirm git base-devel go curl procps-ng 2>&1 | tee -a "$
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
 fi
+fi
 ;;
 zypper)
 ${SUDO} zypper refresh | tee -a "${INSTALL_LOG}"
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+${SUDO} zypper install -y git go curl 2>&1 | tee -a "${INSTALL_LOG}"
+pipestatus_arr=("${PIPESTATUS[@]}")
+install_result="${pipestatus_arr[0]}"
+else
 ${SUDO} zypper install -y git make gcc go curl procps net-tools 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
@@ -1077,6 +1334,7 @@ if [ "${install_result}" -ne 0 ]; then
 ${SUDO} zypper install -y git make gcc go curl procps 2>&1 | tee -a "${INSTALL_LOG}"
 pipestatus_arr=("${PIPESTATUS[@]}")
 install_result="${pipestatus_arr[0]}"
+fi
 fi
 ;;
 *)
@@ -1098,6 +1356,64 @@ fi
 
 check_go_version
 log "依赖安装完成。"
+}
+
+################################ 安装 / 编译 graftcp ################################
+
+# 函数名：install_gg
+# 功能：安装或编译 gg（go-graft）工具
+# 设置变量：GG_BIN
+# 错误处理：克隆或编译失败时调用 error() 退出
+install_gg() {
+if [ -n "${GG_BIN:-}" ] && [ -x "${GG_BIN}" ]; then
+log "检测到环境变量 GG_BIN=${GG_BIN}"
+log "将使用用户指定的 gg 可执行文件"
+return 0
+fi
+
+if [ -x "${GG_DIR}/gg" ]; then
+GG_BIN="${GG_DIR}/gg"
+log "检测到已安装的 gg：${GG_BIN}"
+return 0
+fi
+
+if command -v gg >/dev/null 2>&1; then
+GG_BIN="$(command -v gg)"
+log "检测到系统中可用的 gg：${GG_BIN}"
+return 0
+fi
+
+local gg_repo="${GG_DIR}/src"
+mkdir -p "${GG_DIR}"
+
+if [ ! -d "${gg_repo}/.git" ]; then
+log "开始安装 gg 到：${GG_DIR}"
+mkdir -p "${gg_repo%/*}"
+if ! git clone --depth 1 "https://github.com/mzz2017/gg.git" "${gg_repo}" 2>&1 | tee -a "${INSTALL_LOG}"; then
+error "gg 仓库克隆失败，请检查网络后重试。"
+fi
+else
+log "检测到已有 gg 仓库，尝试更新..."
+(cd "${gg_repo}" && git pull --ff-only 2>&1 | tee -a "${INSTALL_LOG}"; exit "${PIPESTATUS[0]}") || warn "gg 仓库更新失败，将继续使用当前代码。"
+fi
+
+log "开始编译 gg（日志写入：${INSTALL_LOG}）..."
+log "gg 默认使用纯 Go 模式编译（CGO_ENABLED=0），不依赖 gcc / cgo。"
+if ! (
+cd "${gg_repo}" && \
+env -u CC -u CXX -u CFLAGS -u CPPFLAGS -u CXXFLAGS -u LDFLAGS \
+CGO_ENABLED=0 \
+go build -o "${GG_DIR}/gg" .
+) >> "${INSTALL_LOG}" 2>&1; then
+echo ""
+echo "❌ gg 编译失败"
+echo "请检查日志：${INSTALL_LOG}"
+error "gg 编译失败"
+fi
+
+chmod +x "${GG_DIR}/gg" 2>/dev/null || true
+GG_BIN="${GG_DIR}/gg"
+log "gg 安装/编译完成：${GG_BIN}"
 }
 
 ################################ 安装 / 编译 graftcp ################################
@@ -1248,8 +1564,15 @@ done
 
 log "开始编译 graftcp（日志写入：${INSTALL_LOG}）..."
 
+# 在当前脚本中，默认走 cgo 主路径：
+# - 强制使用 CGO_ENABLED=1
+# - 指定 CC/CXX 为 gcc/g++，减少 Conda 交叉工具链干扰
+# - 清理常见会污染 cgo 参数解析的编译变量
+# 如需启用“无 cgo 兜底”，可显式设置：ANTISSH_ALLOW_NO_CGO_FALLBACK=1
+local allow_no_cgo_fallback="${ANTISSH_ALLOW_NO_CGO_FALLBACK:-0}"
+
 # 在部分 Conda/交叉编译环境中，cgo 可能会被注入复杂编译参数，导致 runtime/cgo 报引号解析错误。
-# 这里提供一个兜底：仅对 graftcp-local 使用 CGO_ENABLED=0 编译（不依赖 cgo）。
+# 这里保留一个可选兜底：仅对 graftcp-local 使用 CGO_ENABLED=0 编译（不依赖 cgo）。
 build_graftcp_local_no_cgo_fallback() {
   log "检测到 cgo 相关编译错误，尝试使用无 cgo 模式编译 graftcp-local（CGO_ENABLED=0）..."
 
@@ -1290,21 +1613,23 @@ make clean >> "${INSTALL_LOG}" 2>&1 || true
 sleep 1
 fi
 
-if env ${GOPROXY_ENV} make >> "${INSTALL_LOG}" 2>&1; then
-make_success="true"
-break
+if env -u CFLAGS -u CPPFLAGS -u CXXFLAGS -u LDFLAGS CC=gcc CXX=g++ CGO_ENABLED=1 ${GOPROXY_ENV} make >> "${INSTALL_LOG}" 2>&1; then
+	make_success="true"
+	break
 else
-warn "编译失败，正在分析原因..."
+	warn "编译失败，正在分析原因..."
 
-# 兜底：识别 cgo 引号解析错误（常见于 Conda 环境变量注入）
-if tail -120 "${INSTALL_LOG}" 2>/dev/null | grep -q "# runtime/cgo" && \
-   tail -120 "${INSTALL_LOG}" 2>/dev/null | grep -q "missing terminating"; then
-  if build_graftcp_local_no_cgo_fallback; then
-    log "无 cgo 模式编译 graftcp-local 成功。"
-    make_success="true"
-    break
-  else
-    warn "无 cgo 兜底编译失败，继续按常规方式排查..."
+# 可选兜底：识别 cgo 引号解析错误（常见于 Conda 环境变量注入）
+if [ "${allow_no_cgo_fallback}" = "1" ] || [ "${allow_no_cgo_fallback}" = "true" ] || [ "${allow_no_cgo_fallback}" = "TRUE" ]; then
+  if tail -120 "${INSTALL_LOG}" 2>/dev/null | grep -q "# runtime/cgo" && \
+     tail -120 "${INSTALL_LOG}" 2>/dev/null | grep -q "missing terminating"; then
+    if build_graftcp_local_no_cgo_fallback; then
+      log "无 cgo 模式编译 graftcp-local 成功。"
+      make_success="true"
+      break
+    else
+      warn "无 cgo 兜底编译失败，继续按常规方式排查..."
+    fi
   fi
 fi
 
@@ -1499,14 +1824,10 @@ fi
         TARGET_BIN="${user_candidates[0]}"
         log "选择当前用户的 Agent 服务：${TARGET_BIN}"
       else
-        # 多个当前用户的文件，按修改时间选择最新的
-        log "当前用户有多个版本，选择最新版本..."
-        TARGET_BIN=$(
-          for p in "${user_candidates[@]}"; do
-            printf '%s %s\n' "$(get_file_mtime "${p}" 2>/dev/null || echo 0)" "${p}"
-          done | sort -rn | head -n 1 | cut -d' ' -f2-
-        )
-        log "已选择最新版本：${TARGET_BIN}"
+        # 多个当前用户的文件：按版本号优先，mtime 兜底
+        log "当前用户有多个版本，按版本号优先选择..."
+        TARGET_BIN="$(pick_latest_language_server "${user_candidates[@]}" || true)"
+        log "已选择版本：${TARGET_BIN}"
       fi
     else
       # 没有当前用户的文件，检查其他用户的文件是否有权限
@@ -1531,12 +1852,8 @@ fi
         error "请确保 Antigravity 已安装在当前用户目录（${HOME}/.antigravity-server）"
       fi
 
-      # 选择有权限的最新文件
-      TARGET_BIN=$(
-        for p in "${accessible_candidates[@]}"; do
-          printf '%s %s\n' "$(get_file_mtime "${p}" 2>/dev/null || echo 0)" "${p}"
-        done | sort -rn | head -n 1 | cut -d' ' -f2-
-      )
+      # 选择有权限的文件：按版本号优先，mtime 兜底
+      TARGET_BIN="$(pick_latest_language_server "${accessible_candidates[@]}" || true)"
 
       warn "将使用其他用户的文件（请确认这是您期望的行为）：${TARGET_BIN}"
     fi
@@ -1802,6 +2119,110 @@ fi
 # 注册临时文件到清理列表，确保脚本异常退出时也能清理
 TEMP_FILES_TO_CLEANUP+=("${wrapper_tmp}")
 
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+cat > "${wrapper_tmp}" <<EOF
+#!/usr/bin/env bash
+# 该文件由 antissh.sh 自动生成
+# 用 gg 代理启动原始 Antigravity Agent
+
+umask 077
+
+GG_BIN="${GG_BIN}"
+GG_NODE_LINK="${GG_NODE_LINK}"
+PROXY_TYPE="${PROXY_TYPE}"
+ANTISSH_DISABLE_HTTP2="\${ANTISSH_DISABLE_HTTP2:-0}"
+ANTISSH_DISABLE_TLS13="\${ANTISSH_DISABLE_TLS13:-0}"
+ANTISSH_CDP_PORT="\${ANTISSH_CDP_PORT:-}"
+ANTISSH_DISABLE_PAGE_ACTIONS="\${ANTISSH_DISABLE_PAGE_ACTIONS:-1}"
+LOG_FILE="\$HOME/.graftcp-antigravity/wrapper.log"
+HARDCODED_CDP_PORT_FILE="\$HOME/.graftcp-antigravity/hardcoded-cdp-port.txt"
+
+mkdir -p "\$(dirname "\$LOG_FILE")"
+echo "[\$(date)] Starting wrapper(gg): \$0 \$@" >> "\$LOG_FILE"
+if [ -f "\${HARDCODED_CDP_PORT_FILE}" ]; then
+  hc_port="\$(cat "\${HARDCODED_CDP_PORT_FILE}" 2>/dev/null || true)"
+  if echo "\${hc_port}" | grep -Eq '^[0-9]{4}$'; then
+    echo "[\$(date)] Hardcoded CDP endpoint override: localhost:9222 -> localhost:\${hc_port}" >> "\$LOG_FILE"
+  fi
+fi
+
+pick_free_port() {
+  local start="\$1"
+  local p
+  for p in "\$(seq "\$start" "\$((start+200))")"; do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | awk -v port=":\$p" '\$4 ~ port"$" {found=1} END{exit found}' && continue
+      echo "\$p"
+      return 0
+    fi
+    echo "\$p"
+    return 0
+  done
+  return 1
+}
+
+CDP_PORT=""
+if [ -n "\${ANTISSH_CDP_PORT}" ] && echo "\${ANTISSH_CDP_PORT}" | grep -Eq '^[0-9]+$'; then
+  CDP_PORT="\${ANTISSH_CDP_PORT}"
+else
+  CDP_PORT="24681"
+fi
+
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn 2>/dev/null | awk -v port=":\${CDP_PORT}" '\$4 ~ port"$" {exit 0} END{exit 1}'; then
+    new_port="\$(pick_free_port 24681 2>/dev/null || true)"
+    if [ -n "\${new_port:-}" ]; then
+      CDP_PORT="\${new_port}"
+    fi
+  fi
+fi
+
+echo "[\$(date)] Using CDP_PORT=\${CDP_PORT}" >> "\$LOG_FILE"
+echo "[\$(date)] ANTISSH_DISABLE_PAGE_ACTIONS=\${ANTISSH_DISABLE_PAGE_ACTIONS}" >> "\$LOG_FILE"
+
+# 设置 GODEBUG：保留用户原有值并追加所需配置。
+# 对 gg 而言，这里只处理 HTTP/2 / TLS 兼容开关；不再强制 netdns=cgo。
+EXTRA_GODEBUG=""
+case "\${ANTISSH_DISABLE_HTTP2:-0}" in
+  1|true|TRUE|yes|YES|on|ON) EXTRA_GODEBUG="http2client=0" ;;
+esac
+case "\${ANTISSH_DISABLE_TLS13:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    if [ -n "\${EXTRA_GODEBUG}" ]; then
+      EXTRA_GODEBUG="\${EXTRA_GODEBUG},tls13=0"
+    else
+      EXTRA_GODEBUG="tls13=0"
+    fi
+    ;;
+esac
+if [ -n "\${EXTRA_GODEBUG}" ]; then
+  if [ -n "\${GODEBUG:-}" ]; then
+    export GODEBUG="\${GODEBUG},\${EXTRA_GODEBUG}"
+  else
+    export GODEBUG="\${EXTRA_GODEBUG}"
+  fi
+fi
+
+EXTRA_ARGS=()
+EXTRA_ARGS+=("-cdp_port=\${CDP_PORT}")
+case "\${ANTISSH_DISABLE_PAGE_ACTIONS:-1}" in
+  0|false|FALSE|no|NO|off|OFF) ;;
+  *) EXTRA_ARGS+=("-use_custom_page_actions=false") ;;
+esac
+
+GG_ARGS=("--node" "${GG_NODE_LINK}" "--testnode=false")
+case "\${PROXY_TYPE}" in
+  http|https) GG_ARGS+=("--noudp") ;;
+esac
+
+if [ ! -x "\${GG_BIN}" ]; then
+  echo "[\$(date)] gg binary not found: \${GG_BIN}, fallback to original binary" >> "\$LOG_FILE"
+  exec "\$0.bak" "\$@" "\${EXTRA_ARGS[@]}"
+fi
+
+exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$GG_BIN" "\${GG_ARGS[@]}" "\$0.bak" "\$@" "\${EXTRA_ARGS[@]}"
+EOF
+else
 cat > "${wrapper_tmp}" <<EOF
 #!/usr/bin/env bash
 # 该文件由 antissh.sh 自动生成
@@ -1942,14 +2363,15 @@ fi
 
 # 通过 graftcp 启动原始二进制（指定端口与 FIFO），并清除代理相关环境变量，避免递归代理/死循环
 EXTRA_ARGS=()
-EXTRA_ARGS+=("--cdp_port=\${CDP_PORT}")
+EXTRA_ARGS+=("-cdp_port=\${CDP_PORT}")
 case "\${ANTISSH_DISABLE_PAGE_ACTIONS:-1}" in
   0|false|FALSE|no|NO|off|OFF) ;;
-  *) EXTRA_ARGS+=("--use_custom_page_actions=false") ;;
+  *) EXTRA_ARGS+=("-use_custom_page_actions=false") ;;
 esac
 
 exec "\$GRAFTCP_DIR/graftcp" -p "\$GRAFTCP_LOCAL_PORT" -f "\$GRAFTCP_PIPE_PATH" env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@" "\${EXTRA_ARGS[@]}"
 EOF
+fi
 
 # 设置执行权限
 if ! chmod +x "${wrapper_tmp}"; then
@@ -1973,14 +2395,95 @@ log "已生成代理 wrapper：${TARGET_BIN}"
 
 ################################ 测试代理连通性 ################################
 
+test_proxy_with_gg() {
+if [ -z "${GG_BIN:-}" ] || [ ! -x "${GG_BIN}" ]; then
+error "gg 不可用，无法执行代理连通性测试。"
+fi
+
+if [ -z "${GG_NODE_LINK:-}" ]; then
+build_gg_node_link
+fi
+
+local http_code="000"
+local -a gg_test_args
+gg_test_args=(--node "${GG_NODE_LINK}" --testnode=false)
+if [ "${PROXY_TYPE}" = "http" ] || [ "${PROXY_TYPE}" = "https" ]; then
+gg_test_args+=(--noudp)
+fi
+
+log "使用 gg 测试代理链路..."
+if [ "${PROXY_TYPE}" = "socks5" ]; then
+log "当前为 socks5 节点：gg 将按默认路径保留 UDP/DNS 接管能力。"
+else
+log "当前为 ${PROXY_TYPE} 节点：gg 将附加 --noudp，本次测试只覆盖 TCP 链路。"
+fi
+for attempt in 1 2 3; do
+if [ "${attempt}" -gt 1 ]; then
+log "第 ${attempt} 次尝试测试代理..."
+fi
+http_code=$(
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+"${GG_BIN}" "${gg_test_args[@]}" \
+curl -k --http1.1 -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000"
+)
+if echo "${http_code}" | grep -Eq '^[1-5][0-9][0-9]$'; then
+echo ""
+echo "✅ 代理测试成功！"
+echo "   已成功通过代理访问 google.com (HTTP ${http_code})"
+echo ""
+return 0
+fi
+sleep 1
+done
+
+echo ""
+echo "⚠️ 代理测试失败"
+echo "   无法通过代理访问 google.com (HTTP ${http_code})"
+echo ""
+echo "可能原因："
+echo "  1. 代理服务器未启动或不可用"
+echo "  2. 代理地址配置错误：${PROXY_TYPE}://${PROXY_URL}"
+echo "  3. 代理服务器无法访问外网"
+echo "  4. 测试时网络波动或超时"
+echo ""
+echo "============================================="
+echo " 是否仍然继续完成配置？"
+echo "   - 如果确定代理是可用的，只是测试存在问题，可以选择继续"
+echo "   - 如果代理确实不可用，或者代理配置错误，建议选择退出并检查代理设置"
+echo "============================================="
+read -r -p "继续配置？ [y/N]（默认 N，退出）: " continue_choice
+
+case "${continue_choice}" in
+[Yy]*)
+echo ""
+echo "⚠️ 用户选择忽略测试结果，继续配置..."
+echo "   如果实际使用中代理不生效，请重新检查代理设置。"
+echo ""
+return 0
+;;
+*)
+echo ""
+echo "配置已取消。如需调整代理配置，请重新执行脚本。"
+exit 1
+;;
+esac
+}
+
 # 函数名：test_proxy
-# 功能：测试代理连通性，通过 graftcp 访问 google.com
+# 功能：测试代理连通性（graftcp/gg 后端）
 # 返回：0 成功 / 用户确认继续，非 0 失败及退出
 test_proxy() {
 echo ""
 echo "============================================="
-echo " 正在测试代理连通性..."
+echo " 正在测试代理链路..."
 echo "============================================="
+echo "说明：该测试用于快速验证当前后端的基本可用性；不等于完整 Antigravity 会话回放。"
+echo ""
+
+if [ "${PROXY_BACKEND}" = "gg" ]; then
+test_proxy_with_gg
+return $?
+fi
 
 # 使用全局变量 GRAFTCP_LOCAL_PORT（在 ask_graftcp_port 中设置）
 # 确保变量已设置
@@ -2213,59 +2716,89 @@ fi
 # 函数名：main
 # 功能：脚本主入口，协调所有配置步骤
 main() {
-  echo "==== Antigravity + graftcp 一键配置脚本 ===="
+  parse_args "$@"
+  normalize_proxy_backend
+  echo "==== Antigravity + ${PROXY_BACKEND} 一键配置脚本 ===="
   echo "支持系统：Linux"
   echo "安装日志：${INSTALL_LOG}"
   echo
+  show_backend_selection_hint
 
   check_system
   ask_proxy
-  ask_graftcp_port
-  ask_dns_mode
+  if [ "${PROXY_BACKEND}" = "graftcp" ]; then
+    ask_graftcp_port
+    ask_dns_mode
+  else
+    show_gg_dns_note
+  fi
+  if [ "${PROXY_BACKEND}" = "gg" ]; then
+    build_gg_node_link
+  fi
 
   # 轻量级探测代理可用性，成功则导出代理环境变量供后续 git/curl 使用（可选增益）
   # 探测失败不影响后续流程，继续走镜像下载策略
   probe_and_export_proxy || true
 
   ensure_dependencies
-  install_graftcp
+  if [ "${PROXY_BACKEND}" = "graftcp" ]; then
+    install_graftcp
+  else
+    install_gg
+  fi
   find_language_server
   setup_wrapper
   test_proxy
 
   echo
-	  echo "=================== 配置完成 🎉 ==================="
-	  echo "graftcp 安装目录： ${GRAFTCP_DIR}"
-	  echo "Agent 备份文件：   ${BACKUP_BIN}"
-	  echo "当前代理：         ${PROXY_TYPE}://${PROXY_URL}"
-	  echo "graftcp-local 端口: ${GRAFTCP_LOCAL_PORT}"
-	  echo "硬编码兜底（9222）: ${HARDCODED_CDP_PATCH_RESULT}"
-	  echo
+  echo "=================== 配置完成 🎉 ==================="
+  if [ "${PROXY_BACKEND}" = "graftcp" ]; then
+    echo "graftcp 安装目录： ${GRAFTCP_DIR}"
+    echo "graftcp-local 端口: ${GRAFTCP_LOCAL_PORT}"
+  else
+    echo "gg 可执行文件：     ${GG_BIN}"
+    echo "gg 节点链接：       ${GG_NODE_LINK}"
+  fi
+  echo "Agent 备份文件：   ${BACKUP_BIN}"
+  echo "当前代理：         ${PROXY_TYPE}://${PROXY_URL}"
+  echo "硬编码兜底（9222）: ${HARDCODED_CDP_PATCH_RESULT}"
+  echo
   echo "如需修改代理："
   echo "  1. 直接重新运行本脚本，按提示输入新的代理地址即可。"
   echo "  2. 或手动编辑 wrapper 文件："
   echo "       ${TARGET_BIN}"
-  echo "     修改其中的 PROXY_URL 和 PROXY_TYPE 后重启 antigravity。"
+  if [ "${PROXY_BACKEND}" = "graftcp" ]; then
+    echo "     修改其中的 PROXY_URL 和 PROXY_TYPE 后重启 antigravity。"
+  else
+    echo "     修改其中的 GG_NODE_LINK（以及必要时 PROXY_TYPE）后重启 antigravity。"
+  fi
   echo
-  echo "如需切换 DNS 策略："
-  echo "  1. 重新运行本脚本，在“DNS 解析策略”中选择。"
-  echo "  2. 或手动编辑 wrapper 文件："
-  echo "       ${TARGET_BIN}"
-  echo "     将 ANTISSH_FORCE_SYSTEM_DNS 设置为 1（强制）或 0（不强制）。"
+  if [ "${PROXY_BACKEND}" = "graftcp" ]; then
+    echo "如需切换 DNS 策略："
+    echo "  1. 重新运行本脚本，在“graftcp DNS 解析策略”中选择。"
+    echo "  2. 或手动编辑 wrapper 文件："
+    echo "       ${TARGET_BIN}"
+    echo "     将 ANTISSH_FORCE_SYSTEM_DNS 设置为 1（强制）或 0（不强制）。"
+  else
+    echo "gg 的 DNS / UDP 行为："
+    echo "  1. socks5 节点：默认保留 UDP/DNS 接管能力。"
+    echo "  2. http/https 节点：wrapper 会自动附加 --noudp，DNS 回退到本机解析。"
+    echo "  3. 如需调整，可手动编辑 wrapper 文件中的 GG_ARGS。"
+  fi
   echo
-	  echo "如需完全恢复原始行为："
-	  echo "  mv \"${BACKUP_BIN}\" \"${TARGET_BIN}\""
-	  echo
-	  echo "如需控制“硬编码兜底（9222）”："
-	  echo "  - 默认：ANTISSH_PATCH_HARDCODED_CDP=auto（仅当 9222 被占用时启用）"
-	  echo "  - 强制开启：ANTISSH_PATCH_HARDCODED_CDP=1"
-	  echo "  - 关闭：ANTISSH_PATCH_HARDCODED_CDP=0"
-	  echo "  - 指定 4 位兜底端口：ANTISSH_HARDCODED_CDP_PORT=2468（必须 4 位）"
-	  echo
-	  echo "安装/编译日志位于：${INSTALL_LOG}"
-	  echo
-	  echo "⚠️ 如果是远程连接，请断开并重新连接，即可生效，编码愉快！"
-	  echo "==================================================="
+  echo "如需完全恢复原始行为："
+  echo "  mv \"${BACKUP_BIN}\" \"${TARGET_BIN}\""
+  echo
+  echo "如需控制“硬编码兜底（9222）”："
+  echo "  - 默认：ANTISSH_PATCH_HARDCODED_CDP=auto（仅当 9222 被占用时启用）"
+  echo "  - 强制开启：ANTISSH_PATCH_HARDCODED_CDP=1"
+  echo "  - 关闭：ANTISSH_PATCH_HARDCODED_CDP=0"
+  echo "  - 指定 4 位兜底端口：ANTISSH_HARDCODED_CDP_PORT=2468（必须 4 位）"
+  echo
+  echo "安装/编译日志位于：${INSTALL_LOG}"
+  echo
+  echo "⚠️ 如果是远程连接，请断开并重新连接，即可生效，编码愉快！"
+  echo "==================================================="
 }
 
-main
+main "$@"

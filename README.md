@@ -1,264 +1,224 @@
-﻿# 反重力代理配置工具
+# 反重力代理配置工具
 
-> tyx 注：
-> 当前反重力远端 server 的实现会在二进制中硬编码 `localhost:9222/json/list` 访问，并且文档中未提及如何避免这个访问。
-> 这会在多人开发共享服务器上，当别的用户先占住 `9222` 端口后，我方远端 server 卡在 waiting for language server start ，使得 agent pane 无法 loading 成功。
-> 该 fork 使用了一种釜底抽薪的等长二进制替换兜底方案，解决了这个问题。
-> antigravity 应该不久后会修复类似问题，或者进一步明确文档。
+> 当前 Antigravity 远端 server 的实现会在二进制中硬编码访问 `localhost:9222/json/list`。在多人共享服务器上，一旦别的用户先占住 `9222`，远端 server 可能卡在 waiting for language server start，导致 agent pane 一直加载不出来。
+>
+> 这个 fork 额外做了一个等长二进制替换兜底，用来避开这个问题。
 
-> 且当前 fork 也更适合用户级别 `no-sudo` 情况下，在 `conda` 下准备 `go` 环境并编译，因为该 fork 改为默认禁用 `cgo` 编译，可以避免编译标志在 `conda` 下可能出现的转义识别问题。
+> 当前 fork 默认使用 `gg` 作为代理后端，并默认按纯 Go 路径编译（`CGO_ENABLED=0`）。这样更适合 `no-sudo`、`conda`、共享开发机等环境，也避免了 `cgo` 在部分 Conda 工具链下注入编译标志后引发的转义/解析问题。
 
-为 反重力 Agent 配置代理，解决网络连接问题。
+## 当前设计
+
+- 默认后端是 `gg`
+- `gg` 使用 `ptrace` 接管目标进程网络调用，适合 Linux 用户态、无 sudo 场景
+- `socks5` 是默认推荐路径；`http/https` 也支持，但 `gg` 会自动附加 `--noudp`
+- `graftcp` 仍然保留，作为兼容后端；它更像传统的本地转发方案，需要 `graftcp-local`
+- 本仓库中的 `refresh_antissh.sh` 用于处理 IDE 升级后版本目录变化、残留进程和重新套壳
 
 ## 系统支持
 
-| 系统        | 支持情况 | 说明                                                           |
-| ----------- | -------- | -------------------------------------------------------------- |
-| **Linux**   | 支持     | 使用 graftcp 自动代理（脚本为 Bash，需 Bash >= 4）             |
-| **macOS**   | 不支持   | graftcp 依赖 Linux 的 `ptrace`，推荐使用 Proxifier 或 TUN 模式 |
-| **Windows** | 不支持   | 推荐使用 Proxifier 或 TUN 模式；WSL 可按 Linux 方式使用        |
+| 系统        | 支持情况 | 说明 |
+| ----------- | -------- | ---- |
+| **Linux**   | 支持     | 默认使用 `gg`；可切换到 `graftcp` |
+| **macOS**   | 不支持   | `gg/graftcp` 都依赖 Linux 的 `ptrace`，推荐使用 Proxifier 或 TUN |
+| **Windows** | 不支持   | 推荐使用 Proxifier 或 TUN；WSL 可按 Linux 方式使用 |
 
-## Linux 使用方法
+## 快速开始
 
 ### 1. 下载脚本
 
 ```bash
 curl -O https://raw.githubusercontent.com/ccpopy/antissh/main/antissh.sh
-# 或者国内加速下载
-# curl -O https://ghproxy.net/https://raw.githubusercontent.com/ccpopy/antissh/main/antissh.sh
 chmod +x antissh.sh
 ```
 
 ### 2. 运行脚本
 
+默认走 `gg`：
+
 ```bash
 bash ./antissh.sh
+bash ./antissh.sh --backend gg
 ```
 
-### 3. 脚本执行流程
-
-```mermaid
-flowchart TD
-    A[开始] --> B{检测系统}
-    B -->|Linux| C[询问代理配置]
-    B -->|macOS/Windows| Z1[显示替代方案提示并退出]
-
-    C --> D{用户输入代理地址}
-    D -->|跳过| Z2[退出脚本]
-    D -->|输入代理| E[解析并校验代理格式]
-
-    E --> E1[配置 graftcp-local 端口]
-    E1 --> E2[选择 DNS 解析策略]
-    E2 --> F[轻量级代理探测]
-    F -->|成功| G1[导出 HTTP_PROXY 等环境变量]
-    F -->|失败/超时| G2[继续使用镜像下载策略]
-
-    G1 --> H[检查/安装依赖]
-    G2 --> H
-
-    H --> I{GRAFTCP_DIR 环境变量?}
-    I -->|已设置且有效| J1[跳过编译，使用现有 graftcp]
-    I -->|未设置| J2{本地已有 graftcp?}
-
-    J2 -->|是| J1
-    J2 -->|否| K[克隆 graftcp 仓库]
-
-    K --> L[编译 graftcp]
-    L -->|成功| M[查找 language_server]
-    L -->|失败| Z3[显示手动安装指引并退出]
-
-    J1 --> M
-    M --> N[备份原始文件并生成 wrapper]
-    N --> O[测试代理连通性]
-    O --> P[配置完成 🎉]
-
-    style A fill:#e1f5fe
-    style P fill:#c8e6c9
-    style Z1 fill:#fff3e0
-    style Z2 fill:#fff3e0
-    style Z3 fill:#ffebee
-```
-
-### 4. 按提示操作
-
-脚本会依次：
-
-- 询问是否需要配置代理
-- 输入代理地址，格式如下：
-  - SOCKS5: `socks5://127.0.0.1:10808`
-  - HTTP: `http://127.0.0.1:10809`
-- 配置 graftcp-local 监听端口（默认 2233，多用户环境可自定义）
-- 选择 DNS 解析策略（默认强制系统 DNS）
-- 自动安装依赖和编译 graftcp
-- 自动查找并配置 language_server
-
-### 5. 修改代理
-
-直接重新运行脚本即可更新代理设置。
-
-### 6. 恢复原始状态
+如需切换到 `graftcp`：
 
 ```bash
-mv /path/to/language_server_xxx.bak /path/to/language_server_xxx
+bash ./antissh.sh --backend graftcp
+ANTISSH_PROXY_BACKEND=graftcp bash ./antissh.sh
 ```
 
-路径会在脚本执行完成后显示。
+### 3. 代理地址格式
 
-### 7. 多用户环境（服务器场景）
+默认推荐：
 
-graftcp-local 服务需要监听一个本地端口（默认 2233）。在多用户共享服务器环境下，不同用户需要使用不同的端口以避免冲突。
-
-脚本会在运行时询问端口配置：
-
-```
-请输入端口号（默认 2233，直接回车使用默认）: 2234
+```text
+socks5://127.0.0.1:10808
 ```
 
-- **直接回车**：使用默认端口 2233
-- **输入其他端口**：使用指定的端口（如 2234、2235 等）
+也支持：
 
-端口冲突处理：
+```text
+http://127.0.0.1:10809
+https://127.0.0.1:10810
+```
 
-- 如果端口被其他 graftcp-local 服务占用 → 复用该服务
-- 如果端口被其他进程占用 → 提示重新输入
+说明：
 
----
+- `gg + socks5`：保留 UDP/DNS 接管能力，行为最完整
+- `gg + http/https`：脚本会自动加 `--noudp`，此时 gg 不接管 UDP/DNS，域名解析回退到本机 resolver
+- `graftcp`：主要支持 `socks5/http`；若输入 `https://`，脚本会按 `http://` 处理
 
-## ⚠️ IDE 升级后代理失效问题
+## 后端对比
 
-> [!WARNING]
-> IDE 升级后可能会在 `~/.antigravity-server/bin/` 下新增版本目录，导致之前配置的代理失效。
+| 维度 | `gg`（默认） | `graftcp`（兼容） |
+| ---- | ------------ | ----------------- |
+| 运行方式 | `ptrace` 接管目标进程 | `graftcp + graftcp-local` |
+| 是否需要本地监听端口 | 否 | 是 |
+| 默认编译方式 | 纯 Go（`CGO_ENABLED=0`） | 仍可能涉及 `gcc/make/cgo` 兼容问题 |
+| DNS/UDP 处理 | `socks5` 下可接管；`http/https` 下自动 `--noudp` | 不负责完整 UDP 接管 |
+| 推荐程度 | 默认优先 | 仅保留兼容场景 |
 
-### 如何获取新版本号
+## 脚本当前流程
 
-1. 打开 Antigravity 客户端
-2. 点击 **Help → About**
-3. 点击 **Copy** 按钮复制版本信息
-4. 在复制的版本信息中找到 `Electron: xxxxxxxxx...` 这一行，其中的哈希值（如 `da3eb231fb10e6dc27750aa465b8582265c907d9`）即为版本号
+### `gg` 路径
 
-### 解决方法（二选一）
+1. 询问代理地址
+2. 说明 `gg` 的 DNS / UDP 行为
+3. 做一次轻量级代理探测
+   - 该探测只用于决定后续 `git/curl` 下载阶段是否临时导出代理环境变量
+   - 这一步不等于最终 `language_server` 的真实运行路径
+4. 检查依赖：`git / go / curl`
+5. 编译或复用 `gg`
+6. 查找最新版本的 `language_server_*`
+7. 备份原始二进制，写入 wrapper
+8. 测试 `gg` 代理链路
 
-**方法 1：重新运行脚本（推荐）**
+### `graftcp` 路径
 
-直接重新运行 `antissh.sh`，脚本会自动检测新目录并重新配置。
+1. 询问代理地址
+2. 配置 `graftcp-local` 监听端口
+3. 选择 `graftcp` 的 DNS 策略（是否强制 `netdns=cgo`）
+4. 做一次轻量级代理探测
+5. 检查依赖：`git / make / gcc / go / curl`
+6. 编译或复用 `graftcp`
+7. 查找最新版本的 `language_server_*`
+8. 备份原始二进制，写入 wrapper
+9. 启动 `graftcp-local` 并测试代理链路
 
-**方法 2：手动迁移**
+## IDE 升级后的推荐流程
 
-1. 进入新目录 `~/.antigravity-server/bin/<新版本号>/extensions/antigravity/bin/`
-2. 将 `language_server_linux_*` 重命名为 `language_server_linux_*.bak`
-3. 将原目录中的 wrapper 脚本复制到新目录
+Antigravity 升级后，远端通常会新增一个新的版本目录；这时旧 wrapper 不会自动迁移到新目录。
 
-> [!TIP]
->
-> - **端口配置复用**：wrapper 脚本中保存了完整的配置（包括端口），直接复制即可保持端口配置不变
-> - **重新运行脚本**：如果选择重新运行脚本，需要再次输入相同的端口号
-
-### 常见问题与排查（WSL2 / 代理）
-
-根据 issues 提及到的，下面是相关说明：
-
-- **.bak 文件是预期行为**：`.bak` 是原始二进制，`language_server_*` 会被 wrapper 替换；wrapper 使用 `graftcp` 启动 `.bak`，这是正常流程。
-- **看到 auto（自动转发）**：脚本启动 `graftcp-local` 时使用 `-select_proxy_mode=only_*`，理论上是“用户转发”。若实际看到 auto，多半是复用了旧的 `graftcp-local` 进程或端口。建议先清理旧进程后重新配置。
-- **脚本运行了但远程仍加载不到模型**：通常是本地 IDE 的代理未正常工作。请先确保本地 IDE 能正常加载模型，再在 WSL2 中运行脚本并重新连接。
-- **特殊网络的 DNS 解析问题（SSH / WSL2）**：
-  - **SSH 远程**：有时 `curl` 通过代理访问 Google 是通的，但 `language_server` 仍报 DNS 错。原因是 `curl` 可能依赖代理解析（如 HTTP 代理或 socks5h），而当前 wrapper 默认强制使用系统 DNS（`netdns=cgo`），这两者并不等价。
-  - **建议**：如果 `nslookup` 正常但程序仍报 DNS 问题，可在脚本里选择“不强制系统 DNS”，并由你自己的 DNS 方案（如 smartdns / dnscrypt-proxy）接管解析。
-  - **WSL2**：Mirrored 网络模式下通常不会遇到解析 Google 的问题，一般无需关闭强制系统 DNS；若确实遇到特殊网络限制，再按上面的方案处理即可。
-  - 相关讨论：[#27](https://github.com/ccpopy/antissh/issues/27)
-
-**清理旧进程（按需执行）**
+推荐直接使用 `refresh_antissh.sh`：
 
 ```bash
-# 先查看可能残留的进程
-pgrep -a graftcp-local || true
+# 1) 断开 Remote-SSH 后，先清理残留
+bash ~/antissh/refresh_antissh.sh --cleanup-only
+
+# 2) 重新连接一次，让 IDE 下载新的远端 server
+# 3) 再断开 Remote-SSH，重新套代理
+bash ~/antissh/refresh_antissh.sh
+bash ~/antissh/refresh_antissh.sh --backend graftcp
+```
+
+这个脚本会：
+
+- 清理残留 `language_server / gg / graftcp-local` 进程
+- 清理残留 FIFO / 临时标记
+- 显示当前最新远端 server 版本目录
+- 默认最后重新执行 `antissh.sh`
+
+## 常见问题
+
+### 1. `.bak` 文件是不是异常？
+
+不是。`.bak` 是原始 `language_server_*` 二进制；当前同名文件会被替换成 wrapper，这是预期行为。
+
+### 2. 为什么脚本前半段探测成功，但实际远端还是不通？
+
+因为前半段的“轻量级代理探测”只决定后续 `git/curl` 下载阶段要不要临时导出代理环境变量。它不是完整的 Antigravity 会话验证。
+
+真正相关的是脚本后半段的“代理链路测试”和远端运行日志：
+
+```bash
+tail -n 120 ~/.graftcp-antigravity/wrapper.log
+```
+
+### 3. 为什么 `gg + http/https` 下 DNS 表现和 `gg + socks5` 不一样？
+
+因为 `http/https` 节点不提供完整 UDP 转发能力，脚本会自动给 `gg` 附加 `--noudp`。此时 gg 不接管 UDP/DNS，域名解析回退到本机 resolver。
+
+如果希望尽量保留 gg 的 DNS/UDP 能力，优先使用 `socks5`。
+
+### 4. 为什么 `graftcp` 还要问系统 DNS？
+
+那是 `graftcp` 分支自己的历史兼容逻辑，不是 `gg` 的行为。当前脚本已经把这条提示限制在 `graftcp` 路径里。
+
+### 5. IDE 升级后代理失效怎么办？
+
+优先使用：
+
+```bash
+bash ~/antissh/refresh_antissh.sh --cleanup-only
+bash ~/antissh/refresh_antissh.sh
+```
+
+### 6. agent pane 还是一直 loading，应该先看什么？
+
+先看这几项：
+
+```bash
+# 当前 wrapper 日志
+tail -n 120 ~/.graftcp-antigravity/wrapper.log
+
+# 当前最新 Antigravity 版本目录
+ls -1 ~/.antigravity-server/bin | sort -V | tail -n 5
+
+# 相关进程
 pgrep -a language_server || true
-
-# 确认无用后再清理
-pkill -f graftcp-local || true
-pkill -f language_server || true
+pgrep -a gg || true
+pgrep -a graftcp-local || true
 ```
 
-**本地 IDE 代理建议（二选一即可）**
+## WSL 说明
 
-- Windows/macOS 使用 Proxifier 代理 IDE 进程
-- 使用代理的 TUN 模式
+如果在 WSL 中使用本脚本，建议开启 **Mirrored 网络模式**，这样 WSL 可以直接访问宿主机的 `127.0.0.1` 代理。
 
-### WSL 网络配置（Mirrored 模式）
-
-如果你在 WSL 中使用本脚本，建议开启 **Mirrored 网络模式**，这样 WSL 可以直接使用宿主机的代理（127.0.0.1）。
-
-**配置方法：**
-
-1. 在 Windows 用户目录下创建或编辑 `.wslconfig` 文件：
+`.wslconfig` 示例：
 
 ```ini
-# %USERPROFILE%\.wslconfig
 [wsl2]
 networkingMode=mirrored
 ```
 
-2. 重启 WSL：
+然后执行：
 
 ```powershell
 wsl --shutdown
 ```
 
-3. 重新进入 WSL 后，代理地址可直接使用 `127.0.0.1`：
+重新进入 WSL 后，即可直接使用：
 
-```bash
-# 例如
+```text
 socks5://127.0.0.1:10808
 http://127.0.0.1:10809
 ```
 
-> **注意**：Mirrored 模式需要 Windows 11 22H2 及以上版本，且 WSL 版本 >= 2.0.0。
->
-> 如果不使用 Mirrored 模式，需要使用 WSL 虚拟网卡的网关 IP（通常是 `cat /etc/resolv.conf` 中的 nameserver 地址）。
-
----
-
 ## macOS / Windows 替代方案
 
-由于 graftcp 依赖 Linux 的 `ptrace` 系统调用，在 macOS/Windows 上无法使用。
+由于 `gg/graftcp` 都依赖 Linux 的 `ptrace`，macOS / Windows 上推荐：
 
-### 推荐方案 1：Proxifier（推荐）
-
-1. 下载安装 [Proxifier](https://www.proxifier.com/)
-   - 关于 license key，请自行搜索，有特别版序列号，如有能力请支持正版
-2. 添加代理服务器：
-   - `Profile` → `Proxy Servers` → `Add`
-   - 填入你的代理地址
-3. 添加规则：`Profile` → `Proxification Rules` → `Add`
-   - 应用程序添加以下内容（根据系统选择）：
-     - macOS: `com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64`
-     - Windows: `language_server_windows_x64.exe; Antigravity.exe`
-   - Action 选择刚添加的代理
-
-### 推荐方案 2：TUN 模式
-
-使用 Clash、Surge 等工具开启 TUN 模式，实现全局透明代理。
-
-### 方案 3：环境变量（不推荐）
-
-Agent 服务可能无法走代理，仅供参考：
-
-```bash
-export ALL_PROXY=socks5://127.0.0.1:10808
-export HTTPS_PROXY=http://127.0.0.1:10809
-```
-
----
+1. **Proxifier**：对 IDE 进程做用户态代理
+2. **TUN 模式**：使用 Clash、Surge 等工具做透明代理
 
 ## Antigravity Server 手动安装脚本
 
-IDE 一般会在远程连接时下载一个.antigravity-server 目录，如果远程服务器无法自动下载 Antigravity Server（如网络受限环境），可使用 `installAntigravity.sh` 脚本手动安装。
+远端如果因为网络受限而无法自动下载 `.antigravity-server`，可使用 `installAntigravity.sh` 手动安装。
 
 ### 下载脚本
 
 ```bash
 curl -O https://raw.githubusercontent.com/ccpopy/antissh/main/installAntigravity.sh
-# 或者国内加速下载
-# curl -O https://ghproxy.net/https://raw.githubusercontent.com/ccpopy/antissh/main/installAntigravity.sh
 chmod +x installAntigravity.sh
 ```
 
@@ -272,18 +232,27 @@ chmod +x installAntigravity.sh
 3. 将复制的版本信息粘贴到终端，连续按两次回车
 4. 脚本会自动下载并安装对应版本
 
-> [!NOTE]
 > 此脚本会将组件安装到 `~/.antigravity-server/bin/<commit-id>/` 目录，与 IDE 自动下载的路径一致。
-
----
 
 ## 依赖要求
 
-- **Go**: >= 1.13（脚本会自动安装）
-- **Git, Make, GCC**（脚本会自动安装）
+### 默认 `gg` 后端
+
+- Go >= 1.18
+- Git
+- curl
+
+### `graftcp` 后端
+
+- Go >= 1.13
+- Git
+- Make
+- GCC
+- curl
 
 ## 鸣谢
 
+- [gg](https://github.com/mzz2017/gg)
 - [graftcp](https://github.com/hmgle/graftcp)
 - [思路来源](https://www.v2ex.com/t/1174113)
 
